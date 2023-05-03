@@ -10,8 +10,10 @@ import syslog
 import signal
 import re
 import jinja2
+import threading
 from sonic_py_common import device_info
-from swsscommon.swsscommon import ConfigDBConnector, DBConnector, Table
+from sonic_py_common.general import check_output_pipe
+from swsscommon.swsscommon import ConfigDBConnector, DBConnector, Table, SonicDBConfig
 from swsscommon import swsscommon
 
 # FILE
@@ -60,6 +62,7 @@ CFG_DB = "CONFIG_DB"
 STATE_DB = "STATE_DB"
 HOSTCFGD_MAX_PRI = 10  # Used to enforce ordering b/w daemons under Hostcfgd
 DEFAULT_SELECT_TIMEOUT = 1000
+PORT_INIT_TIMEOUT_SEC = 180
 
 
 def safe_eval(val, default_value=False):
@@ -86,7 +89,17 @@ def signal_handler(sig, frame):
 
 def run_cmd(cmd, log_err=True, raise_exception=False):
     try:
-        subprocess.check_call(cmd, shell=True)
+        subprocess.check_call(cmd)
+    except Exception as err:
+        if log_err:
+            syslog.syslog(syslog.LOG_ERR, "{} - failed: return code - {}, output:\n{}"
+                  .format(err.cmd, err.returncode, err.output))
+        if raise_exception:
+            raise
+
+def run_cmd_pipe(cmd0, cmd1, cmd2, log_err=True, raise_exception=False):
+    try:
+        check_output_pipe(cmd0, cmd1, cmd2)
     except Exception as err:
         if log_err:
             syslog.syslog(syslog.LOG_ERR, "{} - failed: return code - {}, output:\n{}"
@@ -145,11 +158,15 @@ class Feature(object):
             feature_cfg (dict): Feature CONFIG_DB configuration
             deviec_config (dict): DEVICE_METADATA section of CONFIG_DB
         """
+        if 'has_timer' in feature_cfg:
+            err_str = "Invalid obsolete field 'has_timer' in FEATURE table. Please update configuration schema version"
+            syslog.syslog(syslog.LOG_ERR, err_str)
+            raise ValueError(err_str)
 
         self.name = feature_name
         self.state = self._get_feature_table_key_render_value(feature_cfg.get('state'), device_config or {}, ['enabled', 'disabled', 'always_enabled', 'always_disabled'])
         self.auto_restart = feature_cfg.get('auto_restart', 'disabled')
-        self.has_timer = safe_eval(feature_cfg.get('has_timer', 'False'))
+        self.delayed = safe_eval(feature_cfg.get('delayed', 'False'))
         self.has_global_scope = safe_eval(feature_cfg.get('has_global_scope', 'True'))
         self.has_per_asic_scope = safe_eval(self._get_feature_table_key_render_value(feature_cfg.get('has_per_asic_scope', 'False'), device_config or {}, ['True', 'False']))
 
@@ -193,45 +210,107 @@ class FeatureHandler(object):
     FEATURE_STATE_DISABLED = "disabled"
     FEATURE_STATE_FAILED = "failed"
 
-    def __init__(self, config_db, feature_state_table, device_config):
+    def __init__(self, config_db, feature_state_table, device_config, is_advanced_boot):
         self._config_db = config_db
         self._feature_state_table = feature_state_table
         self._device_config = device_config
         self._cached_config = {}
         self.is_multi_npu = device_info.is_multi_npu()
+        self.enable_delayed_service = False
+        self.is_advanced_boot = is_advanced_boot
+        self.lock = threading.Lock()
+        self.port_listener_thread = threading.Thread(target=self._portListener, name='port_listener_thread')
+        self.port_listener_thread.daemon = True
+        self.port_listener_thread.start()
         self._device_running_config = device_info.get_device_runtime_metadata()
+        self.ns_cfg_db = {}
+        self.ns_feature_state_tbl = {}
+
+        # Initlaize Global config that loads all database*.json
+        if self.is_multi_npu:
+            SonicDBConfig.initializeGlobalConfig()
+            namespaces = device_info.get_namespaces()
+            for ns in namespaces:
+                #Connect to ConfigDB in each namespace
+                self.ns_cfg_db[ns] = ConfigDBConnector(namespace=ns)
+                self.ns_cfg_db[ns].connect(wait_for_init=True, retry_on=True)
+
+                #Connect to stateDB in each namespace
+                db_conn = DBConnector(STATE_DB, 0, False, ns);
+                self.ns_feature_state_tbl[ns] = Table(db_conn, 'FEATURE')
+
+    def _enableDelayedServices(self):
+        with self.lock:
+            self.enable_delayed_service = True
+            for feature_name in self._cached_config:
+                if self._cached_config[feature_name].delayed:
+                    self.update_feature_state(self._cached_config[feature_name])
+
+    def _portListener(self):
+        syslog.syslog(syslog.LOG_INFO, "Starting port listener")
+        appl_db_connector = DBConnector("APPL_DB", 0)
+        subscribe_port = swsscommon.SubscriberStateTable(appl_db_connector, "PORT_TABLE")
+        sel = swsscommon.Select()
+        sel.addSelectable(subscribe_port)
+
+        if self.is_advanced_boot:
+             syslog.syslog(syslog.LOG_INFO, "Updating delayed features after warm/fast boot")
+             self._enableDelayedServices()
+
+        while True:
+            (state, selectableObj) = sel.select(PORT_INIT_TIMEOUT_SEC*1000)
+            # Continue if select is timeout or selectable object is not return
+            if state == swsscommon.Select.ERROR:
+                if not self.enable_delayed_service:
+                    syslog.syslog(syslog.LOG_ERR, "Received unexpected error in waiting for port init. Restarting services")
+                    self._enableDelayedServices()
+                continue
+            if state != swsscommon.Select.OBJECT:
+                if not self.enable_delayed_service:
+                    syslog.syslog(syslog.LOG_INFO, "Updating delayed features after timeout")
+                    self._enableDelayedServices()
+                continue
+
+            key, op, fvs = subscribe_port.pop()
+            if not key:
+                break
+            if op == 'SET' and key == 'PortInitDone':
+                syslog.syslog(syslog.LOG_INFO, "Updating delayed features after port initialization")
+                self._enableDelayedServices()
 
     def handler(self, feature_name, op, feature_cfg):
-        if not feature_cfg:
-            syslog.syslog(syslog.LOG_INFO, "Deregistering feature {}".format(feature_name))
-            self._cached_config.pop(feature_name, None)
-            self._feature_state_table._del(feature_name)
-            return
+        with self.lock:
+            if not feature_cfg:
+                syslog.syslog(syslog.LOG_INFO, "Deregistering feature {}".format(feature_name))
+                self._cached_config.pop(feature_name, None)
+                self._feature_state_table._del(feature_name)
+                return
 
-        device_config = {}
-        device_config.update(self._device_config)
-        device_config.update(self._device_running_config)
+            device_config = {}
+            device_config.update(self._device_config)
+            device_config.update(self._device_running_config)
 
-        feature = Feature(feature_name, feature_cfg, device_config)
-        self._cached_config.setdefault(feature_name, Feature(feature_name, {}))
+            feature = Feature(feature_name, feature_cfg, device_config)
+            self._cached_config.setdefault(feature_name, Feature(feature_name, {}))
 
-        # Change auto-restart configuration first.
-        # If service reached failed state before this configuration applies (e.g. on boot)
-        # the next called self.update_feature_state will start it again. If it will fail
-        # again the auto restart will kick-in. Another order may leave it in failed state
-        # and not auto restart.
-        if self._cached_config[feature_name].auto_restart != feature.auto_restart:
-            syslog.syslog(syslog.LOG_INFO, "Auto-restart status of feature '{}' is changed from '{}' to '{}' ..."
-                          .format(feature_name, self._cached_config[feature_name].auto_restart, feature.auto_restart))
-            self.update_systemd_config(feature)
-            self._cached_config[feature_name].auto_restart = feature.auto_restart
+            # Change auto-restart configuration first.
+            # If service reached failed state before this configuration applies (e.g. on boot)
+            # the next called self.update_feature_state will start it again. If it will fail
+            # again the auto restart will kick-in. Another order may leave it in failed state
+            # and not auto restart.
+            if self._cached_config[feature_name].auto_restart != feature.auto_restart:
+                syslog.syslog(syslog.LOG_INFO, "Auto-restart status of feature '{}' is changed from '{}' to '{}' ..."
+                              .format(feature_name, self._cached_config[feature_name].auto_restart, feature.auto_restart))
+                self.update_systemd_config(feature)
+                self._cached_config[feature_name].auto_restart = feature.auto_restart
 
-        # Enable/disable the container service if the feature state was changed from its previous state.
-        if self._cached_config[feature_name].state != feature.state:
-            if self.update_feature_state(feature):
-                self._cached_config[feature_name].state = feature.state
-            else:
-                self.resync_feature_state(self._cached_config[feature_name])
+            # Enable/disable the container service if the feature state was changed from its previous state.
+            if self._cached_config[feature_name].state != feature.state:
+                if self.update_feature_state(feature):
+                    self.sync_feature_asic_scope(feature)
+                    self._cached_config[feature_name] = feature
+                else:
+                    self.resync_feature_state(self._cached_config[feature_name])
 
     def sync_state_field(self, feature_table):
         """
@@ -239,21 +318,22 @@ class FeatureHandler(object):
         Updates the state field in the FEATURE|* tables as the state field
         might have to be rendered based on DEVICE_METADATA table and generated Device Running Metadata
         """
-        for feature_name in feature_table.keys():
-            if not feature_name:
-                syslog.syslog(syslog.LOG_WARNING, "Feature is None")
-                continue
-            
-            device_config = {}
-            device_config.update(self._device_config)
-            device_config.update(self._device_running_config)
+        with self.lock:
+            for feature_name in feature_table.keys():
+                if not feature_name:
+                    syslog.syslog(syslog.LOG_WARNING, "Feature is None")
+                    continue
 
-            feature = Feature(feature_name, feature_table[feature_name], device_config)
+                device_config = {}
+                device_config.update(self._device_config)
+                device_config.update(self._device_running_config)
+                feature = Feature(feature_name, feature_table[feature_name], device_config)
 
-            self._cached_config.setdefault(feature_name, feature)
-            self.update_systemd_config(feature)
-            self.update_feature_state(feature)
-            self.resync_feature_state(feature)
+                self._cached_config.setdefault(feature_name, feature)
+                self.update_systemd_config(feature)
+                self.update_feature_state(feature)
+                self.sync_feature_asic_scope(feature)
+                self.resync_feature_state(feature)
 
     def update_feature_state(self, feature):
         cached_feature = self._cached_config[feature.name]
@@ -286,6 +366,10 @@ class FeatureHandler(object):
                           .format(feature.state, feature.name))
             return False
 
+        if feature.delayed and not self.enable_delayed_service:
+            syslog.syslog(syslog.LOG_INFO, "Feature is {} delayed for port init".format(feature.name))
+            return True
+
         if enable:
             self.enable_feature(feature)
             syslog.syslog(syslog.LOG_INFO, "Feature {} is enabled and started".format(feature.name))
@@ -294,14 +378,12 @@ class FeatureHandler(object):
             self.disable_feature(feature)
             syslog.syslog(syslog.LOG_INFO, "Feature {} is stopped and disabled".format(feature.name))
 
-        self.sync_feature_asic_scope(feature)
-
         return True
 
     def sync_feature_asic_scope(self, feature_config):
         """Updates the has_per_asic_scope field in the FEATURE|* tables as the field
         might have to be rendered based on DEVICE_METADATA table or Device Running configuration.
-        Disable the ASIC instance service unit file it the render value is False and update config 
+        Disable the ASIC instance service unit file it the render value is False and update config
 
         Args:
             feature: An object represents a feature's configuration in `FEATURE`
@@ -311,7 +393,7 @@ class FeatureHandler(object):
             None.
         """
 
-        cmds = []
+
         feature_names, feature_suffixes = self.get_multiasic_feature_instances(feature_config, True)
         for feature_name in feature_names:
             if '@' not in feature_name:
@@ -320,10 +402,11 @@ class FeatureHandler(object):
             if not unit_file_state:
                 continue
             if unit_file_state != "disabled" and not feature_config.has_per_asic_scope:
+                cmds = []
                 for suffix in reversed(feature_suffixes):
-                    cmds.append("sudo systemctl stop {}.{}".format(feature_name, suffix))
-                    cmds.append("sudo systemctl disable {}.{}".format(feature_name, feature_suffixes[-1]))
-                    cmds.append("sudo systemctl mask {}.{}".format(feature_name, feature_suffixes[-1]))
+                    cmds.append(["sudo", "systemctl", "stop", "{}.{}".format(feature_name, suffix)])
+                    cmds.append(["sudo", "systemctl", "disable", "{}.{}".format(feature_name, feature_suffixes[-1])])
+                    cmds.append(["sudo", "systemctl", "mask", "{}.{}".format(feature_name, feature_suffixes[-1])])
                 for cmd in cmds:
                     syslog.syslog(syslog.LOG_INFO, "Running cmd: '{}'".format(cmd))
                     try:
@@ -334,7 +417,11 @@ class FeatureHandler(object):
                         self.set_feature_state(feature, self.FEATURE_STATE_FAILED)
                         return
         self._config_db.mod_entry('FEATURE', feature_config.name, {'has_per_asic_scope': str(feature_config.has_per_asic_scope)})
-    
+
+        # sync has_per_asic_scope to CONFIG_DB in namespaces in multi-asic platform
+        for ns, db in self.ns_cfg_db.items():
+            db.mod_entry('FEATURE', feature_config.name, {'has_per_asic_scope': str(feature_config.has_per_asic_scope)})
+
     def update_systemd_config(self, feature_config):
         """Updates `Restart=` field in feature's systemd configuration file
         according to the value of `auto_restart` field in `FEATURE` table of `CONFIG_DB`.
@@ -363,12 +450,12 @@ class FeatureHandler(object):
             with open(feature_systemd_config_file_path, 'w') as feature_systemd_config_file_handler:
                 feature_systemd_config_file_handler.write(feature_systemd_config)
 
-            syslog.syslog(syslog.LOG_INFO, "Feautre '{}' systemd config file related to auto-restart is updated!"
+            syslog.syslog(syslog.LOG_INFO, "Feature '{}' systemd config file related to auto-restart is updated!"
                           .format(feature_name))
 
         try:
             syslog.syslog(syslog.LOG_INFO, "Reloading systemd configuration files ...")
-            run_cmd("sudo systemctl daemon-reload", raise_exception=True)
+            run_cmd(["sudo", "systemctl", "daemon-reload"], raise_exception=True)
             syslog.syslog(syslog.LOG_INFO, "Systemd configuration files are reloaded!")
         except Exception as err:
             syslog.syslog(syslog.LOG_ERR, "Failed to reload systemd configuration files!")
@@ -385,15 +472,15 @@ class FeatureHandler(object):
             syslog.syslog(syslog.LOG_ERR, "Feature '{}' service not available"
                           .format(feature.name))
 
-        feature_suffixes = ["service"] + (["timer"] if feature.has_timer else [])
+        feature_suffixes = ["service"]
 
         return feature_names, feature_suffixes
 
     def get_systemd_unit_state(self, unit):
         """ Returns service configuration """
 
-        cmd = "sudo systemctl show {} --property UnitFileState".format(unit)
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cmd = ["sudo", "systemctl", "show", unit, "--property", "UnitFileState"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = proc.communicate()
         if proc.returncode != 0:
             syslog.syslog(syslog.LOG_ERR, "Failed to get status of {}: rc={} stderr={}".format(unit, proc.returncode, stderr))
@@ -403,22 +490,21 @@ class FeatureHandler(object):
         return props["UnitFileState"]
 
     def enable_feature(self, feature):
-        cmds = []
         feature_names, feature_suffixes = self.get_multiasic_feature_instances(feature)
         for feature_name in feature_names:
             # Check if it is already enabled, if yes skip the system call
             unit_file_state = self.get_systemd_unit_state("{}.{}".format(feature_name, feature_suffixes[-1]))
             if unit_file_state == "enabled" or not unit_file_state:
                 continue
-
+            cmds = []
             for suffix in feature_suffixes:
-                cmds.append("sudo systemctl unmask {}.{}".format(feature_name, suffix))
+                cmds.append(["sudo", "systemctl", "unmask", "{}.{}".format(feature_name, suffix)])
 
             # If feature has timer associated with it, start/enable corresponding systemd .timer unit
             # otherwise, start/enable corresponding systemd .service unit
 
-            cmds.append("sudo systemctl enable {}.{}".format(feature_name, feature_suffixes[-1]))
-            cmds.append("sudo systemctl start {}.{}".format(feature_name, feature_suffixes[-1]))
+            cmds.append(["sudo", "systemctl", "enable", "{}.{}".format(feature_name, feature_suffixes[-1])])
+            cmds.append(["sudo", "systemctl", "start", "{}.{}".format(feature_name, feature_suffixes[-1])])
 
             for cmd in cmds:
                 syslog.syslog(syslog.LOG_INFO, "Running cmd: '{}'".format(cmd))
@@ -433,18 +519,17 @@ class FeatureHandler(object):
         self.set_feature_state(feature, self.FEATURE_STATE_ENABLED)
 
     def disable_feature(self, feature):
-        cmds = []
         feature_names, feature_suffixes = self.get_multiasic_feature_instances(feature)
         for feature_name in feature_names:
             # Check if it is already disabled, if yes skip the system call
             unit_file_state = self.get_systemd_unit_state("{}.{}".format(feature_name, feature_suffixes[-1]))
             if unit_file_state in ("disabled", "masked") or not unit_file_state:
                 continue
-
+            cmds = []
             for suffix in reversed(feature_suffixes):
-                cmds.append("sudo systemctl stop {}.{}".format(feature_name, suffix))
-                cmds.append("sudo systemctl disable {}.{}".format(feature_name, feature_suffixes[-1]))
-                cmds.append("sudo systemctl mask {}.{}".format(feature_name, feature_suffixes[-1]))
+                cmds.append(["sudo", "systemctl", "stop", "{}.{}".format(feature_name, suffix)])
+                cmds.append(["sudo", "systemctl", "disable", "{}.{}".format(feature_name, feature_suffixes[-1])])
+                cmds.append(["sudo", "systemctl", "mask", "{}.{}".format(feature_name, feature_suffixes[-1])])
             for cmd in cmds:
                 syslog.syslog(syslog.LOG_INFO, "Running cmd: '{}'".format(cmd))
                 try:
@@ -458,11 +543,41 @@ class FeatureHandler(object):
         self.set_feature_state(feature, self.FEATURE_STATE_DISABLED)
 
     def resync_feature_state(self, feature):
-        self._config_db.mod_entry('FEATURE', feature.name, {'state': feature.state})
+        current_entry = self._config_db.get_entry('FEATURE', feature.name)
+        current_feature_state = current_entry.get('state') if current_entry else None
+
+        if feature.state == current_feature_state:
+            return
+
+        # feature.state might be rendered from a template, so that it should resync CONFIG DB
+        # FEATURE table to override the template value to valid state value
+        # ('always_enabled', 'always_disabled', 'disabled', 'enabled'). However, we should only
+        # resync feature state in two cases:
+        #     1. the rendered feature state is always_enabled or always_disabled, it means that the
+        #        feature state is immutable and potential state change during HostConfigDaemon.load
+        #        in redis should be skipped;
+        #     2. the current feature state in DB is a template which should be replaced by rendered feature
+        #        state
+        # For other cases, we should not resync feature.state to CONFIG DB to avoid overriding user configuration.
+        if self._feature_state_is_immutable(feature.state) or self._feature_state_is_template(current_feature_state):
+            self._config_db.mod_entry('FEATURE', feature.name, {'state': feature.state})
+
+            # resync the feature state to CONFIG_DB in namespaces in multi-asic platform
+            for ns, db in self.ns_cfg_db.items():
+                db.mod_entry('FEATURE', feature.name, {'state': feature.state})
 
     def set_feature_state(self, feature, state):
         self._feature_state_table.set(feature.name, [('state', state)])
 
+        # Update the feature state to STATE_DB in namespaces in multi-asic platform
+        for ns, tbl in self.ns_feature_state_tbl.items():
+            tbl.set(feature.name, [('state', state)])
+
+    def _feature_state_is_template(self, feature_state):
+        return feature_state not in ('always_enabled', 'always_disabled', 'disabled', 'enabled')
+
+    def _feature_state_is_immutable(self, feature_state):
+        return feature_state in ('always_enabled', 'always_disabled')
 
 class Iptables(object):
     def __init__(self):
@@ -486,11 +601,11 @@ class Iptables(object):
             self.iptables_handler(row, lpbk_table[row])
 
     def command(self, chain, ip, ver, op):
-        cmd = 'iptables' if ver == '4' else 'ip6tables'
-        cmd += ' -t mangle --{} {} -p tcp --tcp-flags SYN SYN'.format(op, chain)
-        cmd += ' -d' if chain == 'PREROUTING' else ' -s'
-        mss = self.tcpmss if ver == '4' else self.tcp6mss
-        cmd += ' {} -j TCPMSS --set-mss {}'.format(ip, mss)
+        cmd = ['iptables'] if ver == '4' else ['ip6tables']
+        cmd += ['-t', 'mangle', '--{}'.format(op), chain, "-p", "tcp", "--tcp-flags", 'SYN', 'SYN']
+        cmd += ['-d'] if chain == 'PREROUTING' else ['-s']
+        mss = str(self.tcpmss) if ver == '4' else str(self.tcp6mss)
+        cmd += [ip, "-j", "TCPMSS", "--set-mss", mss]
 
         return cmd
 
@@ -526,12 +641,12 @@ class Iptables(object):
                 as a new rule even if it is the same as an existing one. Check this and
                 do nothing if rule exists
                 '''
-                ret = subprocess.call(cmd, shell=True)
+                ret = subprocess.call(cmd)
                 if ret == 0:
                     syslog.syslog(syslog.LOG_INFO, "{} rule exists in {}".format(ip, chain))
                 else:
                     # Modify command from Check to Append
-                    iptables_cmds.append(cmd.replace("check", "append"))
+                    iptables_cmds.append([word.replace('check', 'append') for word in cmd])
 
         for cmd in iptables_cmds:
             syslog.syslog(syslog.LOG_INFO, "Running cmd - {}".format(cmd))
@@ -757,10 +872,31 @@ class AaaCfg(object):
                 interface_ip = ipv4_addr
         return interface_ip
 
+
+    def check_file_not_empty(self, filename):
+        exists = os.path.exists(filename)
+        if not exists:
+            syslog.syslog(syslog.LOG_ERR, "file size check failed: {} is missing".format(filename))
+            return
+
+        size = os.path.getsize(filename)
+        if size == 0:
+            syslog.syslog(syslog.LOG_ERR, "file size check failed: {} is empty, file corrupted".format(filename))
+            return
+
+        syslog.syslog(syslog.LOG_INFO, "file size check pass: {} size is ({}) bytes".format(filename, size))
+
+
     def modify_single_file(self, filename, operations=None):
         if operations:
-            cmd = "sed -e {0} {1} > {1}.new; mv -f {1} {1}.old; mv -f {1}.new {1}".format(' -e '.join(operations), filename)
-            os.system(cmd)
+            e_list = ['-e'] * len(operations)
+            e_operations = [item for sublist in zip(e_list, operations) for item in sublist]
+            with open(filename+'.new', 'w') as f:
+                subprocess.call(["sed"] + e_operations + [filename], stdout=f)
+            subprocess.call(["mv", '-f', filename, filename+'.old'])
+            subprocess.call(['mv', '-f', filename+'.new', filename])
+
+        self.check_file_not_empty(filename)
 
     def modify_conf_file(self):
         authentication = self.authentication_default.copy()
@@ -842,25 +978,25 @@ class AaaCfg(object):
         # /etc/pam.d/sudo is not handled, because it would change the existing
         # behavior. It can be modified once a config knob is added for sudo.
         if os.path.isfile(PAM_AUTH_CONF):
-            self.modify_single_file(ETC_PAMD_SSHD,  [ "'/^@include/s/common-auth$/common-auth-sonic/'" ])
-            self.modify_single_file(ETC_PAMD_LOGIN, [ "'/^@include/s/common-auth$/common-auth-sonic/'" ])
+            self.modify_single_file(ETC_PAMD_SSHD,  [ "/^@include/s/common-auth$/common-auth-sonic/" ])
+            self.modify_single_file(ETC_PAMD_LOGIN, [ "/^@include/s/common-auth$/common-auth-sonic/" ])
         else:
-            self.modify_single_file(ETC_PAMD_SSHD,  [ "'/^@include/s/common-auth-sonic$/common-auth/'" ])
-            self.modify_single_file(ETC_PAMD_LOGIN, [ "'/^@include/s/common-auth-sonic$/common-auth/'" ])
+            self.modify_single_file(ETC_PAMD_SSHD,  [ "/^@include/s/common-auth-sonic$/common-auth/" ])
+            self.modify_single_file(ETC_PAMD_LOGIN, [ "/^@include/s/common-auth-sonic$/common-auth/" ])
 
         # Add tacplus/radius in nsswitch.conf if TACACS+/RADIUS enable
         if 'tacacs+' in authentication['login']:
             if os.path.isfile(NSS_CONF):
-                self.modify_single_file(NSS_CONF, [ "'/^passwd/s/ radius//'" ])
-                self.modify_single_file(NSS_CONF, [ "'/tacplus/b'", "'/^passwd/s/compat/tacplus &/'", "'/^passwd/s/files/tacplus &/'" ])
+                self.modify_single_file(NSS_CONF, [ "/^passwd/s/ radius//" ])
+                self.modify_single_file(NSS_CONF, [ "/tacplus/b", "/^passwd/s/compat/tacplus &/", "/^passwd/s/files/tacplus &/" ])
         elif 'radius' in authentication['login']:
             if os.path.isfile(NSS_CONF):
                 self.modify_single_file(NSS_CONF, [ "'/^passwd/s/tacplus //'" ])
-                self.modify_single_file(NSS_CONF, [ "'/radius/b'", "'/^passwd/s/compat/& radius/'", "'/^passwd/s/files/& radius/'" ])
+                self.modify_single_file(NSS_CONF, [ "/radius/b", "/^passwd/s/compat/& radius/", "/^passwd/s/files/& radius/" ])
         else:
             if os.path.isfile(NSS_CONF):
-                self.modify_single_file(NSS_CONF, [ "'/^passwd/s/tacplus //g'" ])
-                self.modify_single_file(NSS_CONF, [ "'/^passwd/s/ radius//'" ])
+                self.modify_single_file(NSS_CONF, [ "/^passwd/s/tacplus //g" ])
+                self.modify_single_file(NSS_CONF, [ "/^passwd/s/ radius//" ])
 
         # Add tacplus authorization configration in nsswitch.conf
         tacacs_authorization_conf = None
@@ -919,12 +1055,12 @@ class AaaCfg(object):
         # Start the statistics service. Only RADIUS implemented
         if ('radius' in authentication['login']) and ('statistics' in radius_global) and \
                 radius_global['statistics']:
-            cmd = 'service aaastatsd start'
+            cmd = ['service', 'aaastatsd', 'start']
         else:
-            cmd = 'service aaastatsd stop'
+            cmd = ['service', 'aaastatsd', 'stop']
         syslog.syslog(syslog.LOG_INFO, "cmd - {}".format(cmd))
         try:
-            subprocess.check_call(cmd, shell=True)
+            subprocess.check_call(cmd)
         except subprocess.CalledProcessError as err:
             syslog.syslog(syslog.LOG_ERR,
                     "{} - failed: return code - {}, output:\n{}"
@@ -935,7 +1071,7 @@ class PasswHardening(object):
     def __init__(self):
         self.passw_policies_default = {}
         self.passw_policies = {}
-        
+
         self.debug = False
         self.trace = False
 
@@ -971,9 +1107,9 @@ class PasswHardening(object):
 
     def modify_single_file_inplace(self, filename, operations=None):
         if operations:
-            cmd = "sed -i {0} {1}".format(' -i '.join(operations), filename)
+            cmd = ["sed", '-i'] + operations + [filename]
             syslog.syslog(syslog.LOG_DEBUG, "modify_single_file_inplace: cmd - {}".format(cmd))
-            os.system(cmd)
+            subprocess.call(cmd)
 
     def set_passw_hardening_policies(self, passw_policies):
         # Password Hardening flow
@@ -1018,14 +1154,14 @@ class PasswHardening(object):
             self.passwd_aging_expire_modify(curr_expiration, 'MAX_DAYS')
 
             # Aging policy for new users
-            self.modify_single_file_inplace(ETC_LOGIN_DEF, ["\'/^PASS_MAX_DAYS/c\PASS_MAX_DAYS " +str(curr_expiration)+"\'"])
+            self.modify_single_file_inplace(ETC_LOGIN_DEF, ["/^PASS_MAX_DAYS/c\PASS_MAX_DAYS " +str(curr_expiration)])
 
         if self.is_passwd_aging_expire_update(curr_expiration_warning, 'WARN_DAYS'):
             # Aging policy for existing users
             self.passwd_aging_expire_modify(curr_expiration_warning, 'WARN_DAYS')
 
             # Aging policy for new users
-            self.modify_single_file_inplace(ETC_LOGIN_DEF, ["\'/^PASS_WARN_AGE/c\PASS_WARN_AGE " +str(curr_expiration_warning)+"\'"])
+            self.modify_single_file_inplace(ETC_LOGIN_DEF, ["/^PASS_WARN_AGE/c\PASS_WARN_AGE " +str(curr_expiration_warning)])
 
     def passwd_aging_expire_modify(self, curr_expiration, age_type):
         normal_accounts = self.get_normal_accounts()
@@ -1109,7 +1245,7 @@ class PasswHardening(object):
     def modify_passw_conf_file(self):
         passw_policies = self.passw_policies_default.copy()
         passw_policies.update(self.passw_policies)
-        
+
         # set new Password Hardening policies.
         self.set_passw_hardening_policies(passw_policies)
 
@@ -1144,21 +1280,21 @@ class KdumpCfg(object):
             else:
                 enabled = False
             if enabled:
-                run_cmd("sonic-kdump-config --enable")
+                run_cmd(["sonic-kdump-config", "--enable"])
             else:
-                run_cmd("sonic-kdump-config --disable")
+                run_cmd(["sonic-kdump-config", "--disable"])
 
             # Memory configuration
             memory = self.kdump_defaults["memory"]
             if data.get("memory") is not None:
                 memory = data.get("memory")
-            run_cmd("sonic-kdump-config --memory " + memory)
+            run_cmd(["sonic-kdump-config", "--memory", memory])
 
             # Num dumps
             num_dumps = self.kdump_defaults["num_dumps"]
             if data.get("num_dumps") is not None:
                 num_dumps = data.get("num_dumps")
-            run_cmd("sonic-kdump-config --num_dumps " + num_dumps)
+            run_cmd(["sonic-kdump-config", "--num_dumps", num_dumps])
 
 class NtpCfg(object):
     """
@@ -1191,7 +1327,7 @@ class NtpCfg(object):
             return
         else:
             # just restart ntp config
-            cmd = 'systemctl restart ntp-config'
+            cmd = ['systemctl', 'restart', 'ntp-config']
             run_cmd(cmd)
 
     def ntp_global_update(self, key, data, is_load=False):
@@ -1218,12 +1354,12 @@ class NtpCfg(object):
         if orig_src_set != new_src_set:
             syslog.syslog(syslog.LOG_INFO, "ntp global update for source intf old {} new {}, restarting ntp-config"
                           .format(orig_src_set, new_src_set))
-            cmd = 'systemctl restart ntp-config'
+            cmd = ['systemctl', 'restart', 'ntp-config']
             run_cmd(cmd)
         elif new_vrf != orig_vrf:
             syslog.syslog(syslog.LOG_INFO, "ntp global update for vrf old {} new {}, restarting ntp service"
                             .format(orig_vrf, new_vrf))
-            cmd = 'service ntp restart'
+            cmd = ['service', 'ntp', 'restart']
             run_cmd(cmd)
 
     def ntp_server_update(self, key, op, is_load=False):
@@ -1241,7 +1377,7 @@ class NtpCfg(object):
             restart_config = True
 
         if restart_config:
-            cmd = 'systemctl restart ntp-config'
+            cmd = ['systemctl', 'restart', 'ntp-config']
             syslog.syslog(syslog.LOG_INFO, 'ntp server update, restarting ntp-config, ntp servers configured {}'.format(self.ntp_servers))
             run_cmd(cmd)
 
@@ -1303,6 +1439,7 @@ class PamLimitsCfg(object):
                     "modify pam_limits config file failed with exception: {}"
                     .format(e))
 
+
 class DeviceMetaCfg(object):
     """
     DeviceMetaCfg Config Daemon
@@ -1330,23 +1467,23 @@ class DeviceMetaCfg(object):
 
         # Restart hostname-config service when hostname was changed.
         # Empty not allowed
-        if new_hostname and new_hostname != self.hostname:
+        if not new_hostname:
+            syslog.syslog(syslog.LOG_ERR,
+                          'Hostname was not updated: Empty not allowed')
+        elif new_hostname == self.hostname:
+            syslog.syslog(syslog.LOG_INFO,
+                          'Hostname was not updated: Already set up with the same name: {}'.format(self.hostname))
+        else:
             syslog.syslog(syslog.LOG_INFO, 'DeviceMetaCfg: Set new hostname: {}'
                                            .format(new_hostname))
             self.hostname = new_hostname
             try:
-                run_cmd('sudo service hostname-config restart', True, True)
+                run_cmd(['sudo', 'service', 'hostname-config', 'restart'], True, True)
             except subprocess.CalledProcessError as e:
                 syslog.syslog(syslog.LOG_ERR, 'DeviceMetaCfg: Failed to set new'
                                               ' hostname: {}'.format(e))
                 return
-
-            run_cmd('sudo monit reload')
-        else:
-            msg = 'Hostname was not updated: '
-            msg += 'Already set up' if new_hostname else 'Empty not allowed'
-            syslog.syslog(syslog.LOG_ERR, msg)
-
+            run_cmd(['sudo', 'monit', 'reload'])
 
 class MgmtIfaceCfg(object):
     """
@@ -1380,8 +1517,8 @@ class MgmtIfaceCfg(object):
             syslog.syslog(syslog.LOG_INFO, f'MgmtIfaceCfg: Set new interface '
                                            f'config {cfg} for {iface}')
             try:
-                run_cmd('sudo systemctl restart interfaces-config', True, True)
-                run_cmd('sudo systemctl restart ntp-config', True, True)
+                run_cmd(['sudo', 'systemctl', 'restart', 'interfaces-config'], True, True)
+                run_cmd(['sudo', 'systemctl', 'restart', 'ntp-config'], True, True)
             except subprocess.CalledProcessError:
                 syslog.syslog(syslog.LOG_ERR, f'Failed to restart management '
                               'interface services')
@@ -1404,9 +1541,9 @@ class MgmtIfaceCfg(object):
 
         # Restart related vrfs services
         try:
-            run_cmd('service ntp stop', True, True)
-            run_cmd('systemctl restart interfaces-config', True, True)
-            run_cmd('service ntp start', True, True)
+            run_cmd(['service', 'ntp', 'stop'], True, True)
+            run_cmd(['systemctl', 'restart', 'interfaces-config'], True, True)
+            run_cmd(['service', 'ntp', 'start'], True, True)
         except subprocess.CalledProcessError:
             syslog.syslog(syslog.LOG_ERR, f'Failed to restart management vrf '
                           'services')
@@ -1425,23 +1562,98 @@ class MgmtIfaceCfg(object):
             202     00000000        0       0       0
             """
             try:
-                run_cmd(r"""cat /proc/net/route | grep -E \"eth0\s+"""
-                        r"""00000000\s+[0-9A-Z]+\s+[0-9]+\s+[0-9]+\s+[0-9]+"""
-                        r"""\s+202\" | wc -l""",
-                        True, True)
+                cmd0 = ['cat', '/proc/net/route']
+                cmd1 = ['grep', '-E', r"eth0\s+00000000\s+[0-9A-Z]+\s+[0-9]+\s+[0-9]+\s+[0-9]+\s+202"]
+                cmd2 = ['wc', '-l']
+                run_cmd_pipe(cmd0, cmd1, cmd2, True, True)
             except subprocess.CalledProcessError:
                 syslog.syslog(syslog.LOG_ERR, 'MgmtIfaceCfg: Could not delete '
                                               'eth0 route')
                 return
 
-            run_cmd("ip -4 route del default dev eth0 metric 202", False)
+            run_cmd(["ip", "-4", "route", "del", "default", "dev", "eth0", "metric", "202"], False)
 
         # Update cache
         self.mgmt_vrf_enabled = enabled
 
 
+class SyslogCfg:
+    SYSLOG_RATE_LIMIT_INTERVAL = 'rate_limit_interval'
+    SYSLOG_RATE_LIMIT_BURST = 'rate_limit_burst'
+    HOST_KEY = 'GLOBAL'
+
+    # syslog conf file path in docker
+    SYSLOG_CONF_PATH = '/etc/rsyslog.conf'
+
+    # Regular expressions to extract value from rsyslog.conf
+    INTERVAL_PATTERN = '.*SystemLogRateLimitInterval\s+(\d+).*'
+    BURST_PATTERN = '.*SystemLogRateLimitBurst\s+(\d+).*'
+
+    def __init__(self):
+        self.current_interval, self.current_burst = self.parse_syslog_conf()
+
+    def syslog_update(self, data):
+        """Update syslog related configuration
+
+        Args:
+            data (dict): CONFIG DB data: {<field_name>: <field_value>}
+        """
+        new_interval = '0'
+        new_burst = '0'
+        if data:
+            new_interval = data.get(self.SYSLOG_RATE_LIMIT_INTERVAL, '0')
+            new_burst = data.get(self.SYSLOG_RATE_LIMIT_BURST, '0')
+
+        if new_interval == self.current_interval and new_burst == self.current_burst:
+            return
+
+        syslog.syslog(syslog.LOG_INFO, f'Configure syslog rate limit interval={new_interval} (old:{self.current_interval}), burst={new_burst} (old:{self.current_burst})')
+
+        try:
+            run_cmd(['systemctl', 'reset-failed', 'rsyslog-config', 'rsyslog'], raise_exception=True)
+            run_cmd(['systemctl', 'restart', 'rsyslog-config'], raise_exception=True)
+            self.current_interval = new_interval
+            self.current_burst = new_burst
+        except Exception as e:
+            syslog.syslog(syslog.LOG_ERR, f'Failed to configure syslog rate limit for host - {e}')
+
+    def load(self, data):
+        if self.HOST_KEY in data:
+            self.syslog_update(data[self.HOST_KEY])
+
+    def parse_syslog_conf(self):
+        """Parse existing syslog conf and extract config values
+
+        Returns:
+            tuple: interval,burst,target_ip
+        """
+        interval = '0'
+        burst = '0'
+
+        try:
+            with open(self.SYSLOG_CONF_PATH, 'r') as f:
+                content = f.read()
+                pattern = re.compile(self.INTERVAL_PATTERN)
+                for match in pattern.finditer(content):
+                    interval = match.group(1)
+                    break
+
+                pattern = re.compile(self.BURST_PATTERN)
+                for match in pattern.finditer(content):
+                    burst = match.group(1)
+                    break
+        except OSError:
+            syslog.syslog(syslog.LOG_ERR, f'Failed to read file {self.SYSLOG_CONF_PATH}')
+            return interval, burst
+        return interval, burst
+
 class HostConfigDaemon:
     def __init__(self):
+        self.state_db_conn = DBConnector(STATE_DB, 0)
+        self.advanced_boot = False
+        if swsscommon.RestartWaiter.isAdvancedBootInProgress(self.state_db_conn):
+            self.advanced_boot = True
+            swsscommon.RestartWaiter.waitAdvancedBootDone()
         # Just a sanity check to verify if the CONFIG_DB has been initialized
         # before moving forward
         self.config_db = ConfigDBConnector()
@@ -1453,7 +1665,6 @@ class HostConfigDaemon:
         self.device_config['DEVICE_METADATA'] = self.config_db.get_table('DEVICE_METADATA')
 
         # Load feature state table
-        self.state_db_conn = DBConnector(STATE_DB, 0)
         feature_state_table = Table(self.state_db_conn, 'FEATURE')
 
         # Initialize KDump Config and set the config to default if nothing is provided
@@ -1463,7 +1674,7 @@ class HostConfigDaemon:
         self.iptables = Iptables()
 
         # Intialize Feature Handler
-        self.feature_handler = FeatureHandler(self.config_db, feature_state_table, self.device_config)
+        self.feature_handler = FeatureHandler(self.config_db, feature_state_table, self.device_config, self.advanced_boot)
 
         # Initialize Ntp Config Handler
         self.ntpcfg = NtpCfg()
@@ -1486,6 +1697,9 @@ class HostConfigDaemon:
         # Initialize MgmtIfaceCfg
         self.mgmtifacecfg = MgmtIfaceCfg()
 
+        # Initialize SyslogCfg
+        self.syslogcfg = SyslogCfg()
+
     def load(self, init_data):
         features = init_data['FEATURE']
         aaa = init_data['AAA']
@@ -1501,6 +1715,7 @@ class HostConfigDaemon:
         dev_meta = init_data.get(swsscommon.CFG_DEVICE_METADATA_TABLE_NAME, {})
         mgmt_ifc = init_data.get(swsscommon.CFG_MGMT_INTERFACE_TABLE_NAME, {})
         mgmt_vrf = init_data.get(swsscommon.CFG_MGMT_VRF_CONFIG_TABLE_NAME, {})
+        syslog = init_data.get('SYSLOG_CONFIG', {})
 
         self.feature_handler.sync_state_field(features)
         self.aaacfg.load(aaa, tacacs_global, tacacs_server, radius_global, radius_server)
@@ -1510,6 +1725,7 @@ class HostConfigDaemon:
         self.passwcfg.load(passwh)
         self.devmetacfg.load(dev_meta)
         self.mgmtifacecfg.load(mgmt_ifc, mgmt_vrf)
+        self.syslogcfg.load(syslog)
 
         # Update AAA with the hostname
         self.aaacfg.hostname_update(self.devmetacfg.hostname)
@@ -1609,11 +1825,14 @@ class HostConfigDaemon:
         syslog.syslog(syslog.LOG_INFO, 'DeviceMeta handler...')
         self.devmetacfg.hostname_update(data)
 
+    def syslog_handler(self, key, op, data):
+        self.syslogcfg.syslog_update(data)
+
     def wait_till_system_init_done(self):
         # No need to print the output in the log file so using the "--quiet"
         # flag
-        systemctl_cmd = "sudo systemctl is-system-running --wait --quiet"
-        subprocess.call(systemctl_cmd, shell=True)
+        systemctl_cmd = ["sudo", "systemctl", "is-system-running", "--wait", "--quiet"]
+        subprocess.call(systemctl_cmd)
 
     def register_callbacks(self):
 
@@ -1647,7 +1866,7 @@ class HostConfigDaemon:
         self.config_db.subscribe('VLAN_SUB_INTERFACE', make_callback(self.vlan_sub_intf_handler))
         self.config_db.subscribe('PORTCHANNEL_INTERFACE', make_callback(self.portchannel_intf_handler))
         self.config_db.subscribe('INTERFACE', make_callback(self.phy_intf_handler))
-        
+
         # Handle DEVICE_MEATADATA changes
         self.config_db.subscribe(swsscommon.CFG_DEVICE_METADATA_TABLE_NAME,
                                  make_callback(self.device_metadata_handler))
@@ -1655,6 +1874,8 @@ class HostConfigDaemon:
         # Handle MGMT_VRF_CONFIG changes
         self.config_db.subscribe(swsscommon.CFG_MGMT_VRF_CONFIG_TABLE_NAME,
                                  make_callback(self.mgmt_vrf_handler))
+
+        self.config_db.subscribe('SYSLOG_CONFIG', make_callback(self.syslog_handler))
 
         syslog.syslog(syslog.LOG_INFO,
                       "Waiting for systemctl to finish initialization")

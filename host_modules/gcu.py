@@ -10,11 +10,11 @@ class GCU(host_service.HostModule):
     DBus endpoint that executes the generic config updater command
     """
     @host_service.method(host_service.bus_name(MOD_NAME), in_signature='s', out_signature='is')
-    def apply_patch_db(self, patch_file_path):
+    def apply_patch_db(self, patch_text):
+        input_bytes = (patch_text + '\n').encode('utf-8')
+        cmd = ['/usr/local/bin/config', 'apply-patch', '-f', 'CONFIGDB', '/dev/stdin']
 
-        cmd = ['/usr/local/bin/config', 'apply-patch', '-f', 'CONFIGDB', patch_file_path]
-
-        result = subprocess.run(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(cmd, input=input_bytes, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         msg = ''
         if result.returncode:
             lines = result.stderr.decode().split('\n')
@@ -25,11 +25,11 @@ class GCU(host_service.HostModule):
         return result.returncode, msg
 
     @host_service.method(host_service.bus_name(MOD_NAME), in_signature='s', out_signature='is')
-    def apply_patch_yang(self, patch_file_path):
+    def apply_patch_yang(self, patch_text):
+        input_bytes = (patch_text + '\n').encode('utf-8')
+        cmd = ['/usr/local/bin/config', 'apply-patch', '-f', 'SONICYANG', '/dev/stdin']
 
-        cmd = ['/usr/local/bin/config', 'apply-patch', '-f', 'SONICYANG', patch_file_path]
-
-        result = subprocess.run(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(cmd, input=input_bytes, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         msg = ''
         if result.returncode:
             lines = result.stderr.decode().split('\n')
@@ -68,8 +68,4 @@ class GCU(host_service.HostModule):
                     msg = line
                     break
         return result.returncode, msg
-
-def register():
-    """Return class and module name"""
-    return GCU, MOD_NAME
 

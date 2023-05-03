@@ -18,7 +18,7 @@ HOSTCFGD_TEST_RADIUS_VECTOR = [
                         "auto_restart": "enabled",
                         "has_global_scope": "True",
                         "has_per_asic_scope": "False",
-                        "has_timer": "False",
+                        "delayed": "False",
                         "high_mem_alert": "disabled",
                         "set_owner": "kube",
                         "state": "enabled"
@@ -73,7 +73,7 @@ HOSTCFGD_TEST_RADIUS_VECTOR = [
                         "auto_restart": "enabled",
                         "has_global_scope": "True",
                         "has_per_asic_scope": "False",
-                        "has_timer": "False",
+                        "delayed": "False",
                         "high_mem_alert": "disabled",
                         "set_owner": "kube",
                         "state": "enabled"
@@ -111,7 +111,7 @@ HOSTCFGD_TEST_RADIUS_VECTOR = [
                 },
             },
             "expected_subprocess_calls": [
-                call("service aaastatsd start", shell=True),
+                call(["service", "aaastatsd", "start"]),
             ],
         }
     ],
@@ -129,7 +129,7 @@ HOSTCFGD_TEST_RADIUS_VECTOR = [
                         "auto_restart": "enabled",
                         "has_global_scope": "True",
                         "has_per_asic_scope": "False",
-                        "has_timer": "False",
+                        "delayed": "False",
                         "high_mem_alert": "disabled",
                         "set_owner": "kube",
                         "state": "enabled"
@@ -160,7 +160,7 @@ HOSTCFGD_TEST_RADIUS_VECTOR = [
                         "auto_restart": "enabled",
                         "has_global_scope": "True",
                         "has_per_asic_scope": "False",
-                        "has_timer": "False",
+                        "delayed": "False",
                         "high_mem_alert": "disabled",
                         "set_owner": "kube",
                         "state": "enabled"
@@ -174,7 +174,7 @@ HOSTCFGD_TEST_RADIUS_VECTOR = [
                 },
             },
             "expected_subprocess_calls": [
-                call("service aaastatsd start", shell=True),
+                call(["service", "aaastatsd", "start"]),
             ],
         },
     ],
