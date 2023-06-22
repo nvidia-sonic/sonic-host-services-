@@ -1,3 +1,4 @@
+import time
 class MockConfigDb(object):
     """
         Mock Config DB which responds to data tables requests and store updates to the data table
@@ -14,6 +15,10 @@ class MockConfigDb(object):
         MockConfigDb.CONFIG_DB = test_config_db
 
     @staticmethod
+    def mod_config_db(test_config_db):
+        MockConfigDb.CONFIG_DB.update(test_config_db)
+
+    @staticmethod
     def deserialize_key(key, separator="|"):
         tokens = key.split(separator)
         if len(tokens) > 1:
@@ -26,6 +31,9 @@ class MockConfigDb(object):
         return MockConfigDb.CONFIG_DB
 
     def connect(self, wait_for_init=True, retry_on=True):
+        pass
+
+    def close(self, db_name):
         pass
 
     def get(self, db_id, key, field):
@@ -55,7 +63,80 @@ class MockConfigDb(object):
         for e in MockConfigDb.event_queue:
             self.handlers[e[0]](e[0], e[1], self.get_entry(e[0], e[1]))
 
+class MockSelect():
+
+    event_queue = []
+    OBJECT = "OBJECT"
+    ERROR = ""
+
+    @staticmethod
+    def set_event_queue(Q):
+        MockSelect.event_queue = Q
+
+    @staticmethod
+    def get_event_queue():
+        return MockSelect.event_queue
+
+    @staticmethod
+    def reset_event_queue():
+        MockSelect.event_queue = []
+
+    def __init__(self):
+        self.sub_map = {}
+        self.TIMEOUT = "TIMEOUT"
+        self.ERROR = "ERROR"
+
+    def addSelectable(self, subscriber):
+        self.sub_map[subscriber.table] = subscriber
+
+    def select(self, TIMEOUT):
+        if not MockSelect.get_event_queue():
+            time.sleep(TIMEOUT/1000)
+            return "TIMEOUT", {}
+        table, key = MockSelect.get_event_queue().pop(0)
+        self.sub_map[table].nextKey(key)
+        self.reset_event_queue()
+        return "OBJECT", self.sub_map[table]
+
+
+class MockSubscriberStateTable():
+
+    FD_INIT = 0
+
+    @staticmethod
+    def generate_fd():
+        curr = MockSubscriberStateTable.FD_INIT
+        MockSubscriberStateTable.FD_INIT = curr + 1
+        return curr
+
+    @staticmethod
+    def reset_fd():
+        MockSubscriberStateTable.FD_INIT = 0
+
+    def __init__(self, conn, table, pop=None, pri=None):
+        self.fd = MockSubscriberStateTable.generate_fd()
+        self.next_key = ''
+        self.table = table
+
+    def getFd(self):
+        return self.fd
+
+    def nextKey(self, key):
+        print("next key")
+        self.next_key = key
+
+    def pop(self):
+        table = MockConfigDb.CONFIG_DB.get(self.table, {})
+        print(self.next_key)
+        if self.next_key not in table:
+            op = "DEL"
+            fvs = {}
+        else:
+            op = "SET"
+            fvs = table.get(self.next_key, {})
+        return self.next_key, op, fvs
+
 
 class MockDBConnector():
-    def __init__(self, db, val):
+    def __init__(self, db, val, tcpFlag=False, name=None):
         pass
